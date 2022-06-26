@@ -4,41 +4,55 @@
 // This SAFE Network Software is licensed under the BSD-3-Clause license.
 // Please see the LICENSE file for more details.
 
+use std::borrow::Borrow;
 use crate::dev_utils::{create_ids, PeerId};
 use crate::key_gen::{message::Message, Error, KeyGen, MessageAndTarget};
 use anyhow::{format_err, Result};
 use bincode::serialize;
-use blsttc::{PublicKeySet, SignatureShare};
+use blsttc::{PublicKey, PublicKeySet, SignatureShare};
 use itertools::Itertools;
 use rand::{Rng, RngCore};
 use std::collections::{BTreeMap, BTreeSet};
+use blsttc::poly::Poly;
 use xor_name::XorName;
+use crate::Phase::Commitment;
 
 // Alter the configure of the number of nodes and the threshold.
-const NODENUM: usize = 5;
-const THRESHOLD: usize = 3;
+const CLANS_PER_TRIBE: usize = 5;
+const NODES_PER_CLAN: usize = 5;
+const TRIBE_THRESHOLD: usize = 3;
+const CLAN_THRESHOLD: usize = 3;
 
 fn setup_generators<R: RngCore>(
     mut rng: &mut R,
     non_responsives: BTreeSet<u64>,
 ) -> Result<(Vec<PeerId>, Vec<KeyGen>)> {
     // Generate individual ids.
-    let peer_ids: Vec<PeerId> = create_ids(NODENUM);
+    let peer_ids: Vec<PeerId> = create_ids(CLANS_PER_TRIBE*NODES_PER_CLAN);
 
     Ok((
         peer_ids.clone(),
-        create_generators(&mut rng, non_responsives, &peer_ids, THRESHOLD)?,
+        create_generators(&mut rng, non_responsives, &peer_ids)?,
     ))
 }
 
 fn create_generators<R: RngCore>(
     mut rng: &mut R,
     non_responsives: BTreeSet<u64>,
-    peer_ids: &[PeerId],
-    threshold: usize,
+    peer_ids: &[PeerId]
 ) -> Result<Vec<KeyGen>> {
     // Generate individual key pairs.
-    let names: BTreeSet<XorName> = peer_ids.iter().map(|peer_id| peer_id.name()).collect();
+    let mut tribe: Vec<BTreeSet<XorName>> = Vec::new();
+
+    // Creating a tribe using PeerIds
+    for i in 0..CLANS_PER_TRIBE{
+        let mut clan: BTreeSet<XorName> = BTreeSet::new();
+        for j in 0..NODES_PER_CLAN{
+            clan.insert(peer_ids[i*NODES_PER_CLAN + j].name());
+        }
+        tribe.push(clan);
+    }
+
 
     // Create the `KeyGen` instances
     let mut generators = Vec::new();
@@ -46,7 +60,7 @@ fn create_generators<R: RngCore>(
     for peer_id in peer_ids.iter() {
         let key_gen = {
             let (key_gen, messaging) =
-                match KeyGen::initialize(peer_id.name(), threshold, names.clone()) {
+                match KeyGen::initialize(peer_id.name(), CLANS_PER_TRIBE, TRIBE_THRESHOLD, NODES_PER_CLAN, CLAN_THRESHOLD, tribe.clone()) {
                     Ok(result) => result,
                     Err(err) => {
                         return Err(format_err!(
@@ -115,15 +129,113 @@ fn messaging<R: RngCore>(
 #[test]
 fn all_nodes_being_responsive() -> Result<()> {
     let mut rng = rand::thread_rng();
-    let (_, mut generators) = setup_generators(&mut rng, BTreeSet::new())?;
-    // With all participants responding properly, the key generating procedure shall be completed
-    // automatically. As when there is no complaint, Justification phase will be triggered directly.
-    assert!(generators
+    let (peer_ids, mut generators) = setup_generators(&mut rng, BTreeSet::new())?;
+
+    // With all participants responding properly, we need to call timed phase transition to move from
+    // contributing phase to finalization phase and then call the key generating procedure
+    peer_ids.iter().enumerate().for_each(|(index, _peer_id)| {
+        if let Ok(result) = generators[index].timed_phase_transition(&mut rng) {
+            assert!(result.is_empty());
+        }
+    });
+
+    //Generating keys
+    /*assert!(generators
         .iter_mut()
-        .all(|key_gen| key_gen.generate_keys().is_some()));
+        .all(|key_gen| key_gen.generate_keys().is_some()));*/
+
+
+    //Testing Signature generation and verification
+
+    let msg = "Test message!";
+
+    let mut clan_signatures: BTreeMap<usize, SignatureShare> = BTreeMap::new();
+    let mut clan_public_keys = Vec::new();
+
+    // generating and verifying signatures in clans
+    for i in 0..CLANS_PER_TRIBE{
+
+        let pub_key_set: PublicKeySet = generators[i*NODES_PER_CLAN]
+            .generate_keys()
+            .expect("Failed to generate `PublicKeySet` for node #0")
+            .1
+            .public_key_set;
+
+        let mut sig_shares: BTreeMap<usize, SignatureShare> = BTreeMap::new();
+
+        for j in 0..NODES_PER_CLAN{
+
+            let outcome = if let Some(outcome) = generators[i*NODES_PER_CLAN + j].generate_keys() {
+                outcome.1
+            } else {
+                return Err(format_err!(
+                    "Failed to generate `PublicKeySet` and `SecretKeyShare` for node #{}, {}",
+                    i+1, j+1
+                ));
+            };
+
+            let sk = outcome.secret_key_share;
+            let index = generators[i*NODES_PER_CLAN + j].our_index.1 as usize;
+            let pks = outcome.public_key_set;
+            assert_eq!(pks, pub_key_set);
+            let sig = sk.sign(msg);
+            assert!(pks.public_key_share(index).verify(&sig, msg));
+            let _ = sig_shares.insert(index, sig);
+
+        }
+
+        let sig = match pub_key_set.combine_signatures(sig_shares.iter()) {
+            Ok(sig) => sig,
+            Err(e) => return Err(format_err!("Unexpected Error {:?}: Not able to generate Signature with THRESHOLD + 1 sig_shares", e)),
+        };
+
+        assert!(pub_key_set.public_key().verify(&sig, msg));
+
+        let clan_idx = generators[i*NODES_PER_CLAN].our_index.0 as usize;
+        let _ = clan_signatures.insert(clan_idx, SignatureShare(sig));
+
+        clan_public_keys.push((i, pub_key_set.public_key_G1()));
+
+    }
+
+
+    // aggregating and verifying tribe level signature
+
+    let tribe_public_key_g1 = crate::blsttc::interpolate(TRIBE_THRESHOLD-1, clan_public_keys).expect("wrong number of values");
+    let tribe_public_key: PublicKey = tribe_public_key_g1.into();
+
+    let rand_poly: Poly = Poly::random(TRIBE_THRESHOLD-1, &mut rng);
+    let rand_public_key: PublicKeySet =  rand_poly.commitment().into();
+
+    let tribe_signature = match rand_public_key.combine_signatures(clan_signatures.iter()) {
+        Ok(sig) => sig,
+        Err(e) => return Err(format_err!("Unexpected Error {:?}: Not able to generate Signature with THRESHOLD + 1 sig_shares", e)),
+    };
+
+    assert!(tribe_public_key.verify(&tribe_signature, msg));
+
+
+
+
+
+
+
+
+
+    /*let tribe_sig = match pub_key_set.combine_signatures(sig_shares.iter()) {
+        Ok(sig) => sig,
+        Err(e) => return Err(format_err!("Unexpected Error {:?}: Not able to generate Signature with THRESHOLD + 1 sig_shares", e)),
+    };*/
+
+
+
+
+
     Ok(())
+
 }
 
+/*
 #[test]
 fn having_max_unresponsive_nodes_still_work() -> Result<()> {
     let mut rng = rand::thread_rng();
@@ -211,6 +323,7 @@ fn having_max_unresponsive_nodes_still_work() -> Result<()> {
     }
     Ok(())
 }
+
 
 #[test]
 fn having_min_unresponsive_nodes_cause_block() -> Result<()> {
@@ -440,3 +553,4 @@ fn network_churning() -> Result<()> {
     }
     Ok(())
 }
+*/

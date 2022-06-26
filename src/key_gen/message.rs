@@ -15,38 +15,40 @@ use xor_name::XorName;
 /// SHA3-256 hash digest.
 type Digest256 = [u8; 32];
 
-/// Messages used for running BLS DKG.
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+/// Messages used for running BLS DKG. //PartialOrd, Ord,
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(bound = "")]
 pub enum Message {
     Initialization {
-        key_gen_id: u64,
-        m: usize,
-        n: usize,
-        member_list: BTreeSet<XorName>,
+        key_gen_id: (u64,u64),
+        m1: usize,
+        n1: usize,
+        m2: usize,
+        n2: usize,
+        member_list: Vec<BTreeSet<XorName>>,
     },
     Proposal {
-        key_gen_id: u64,
+        key_gen_id: (u64,u64),
         part: Part,
     },
     Complaint {
-        key_gen_id: u64,
-        target: u64,
+        key_gen_id: (u64,u64),
+        target: (u64,u64),
         msg: Vec<u8>,
     },
     Justification {
-        key_gen_id: u64,
+        key_gen_id: (u64,u64),
         keys_map: BTreeMap<XorName, (Key, Iv)>,
     },
     Acknowledgment {
-        key_gen_id: u64,
+        key_gen_id: (u64,u64),
         ack: Acknowledgment,
     },
 }
 
 impl Message {
     // Creator of the message.
-    pub fn creator(&self) -> u64 {
+    pub fn creator(&self) -> (u64, u64) {
         match &*self {
             Message::Initialization { key_gen_id, .. }
             | Message::Proposal { key_gen_id, .. }
@@ -83,16 +85,16 @@ impl fmt::Debug for Message {
                 member_list, key_gen_id
             ),
             Message::Proposal { key_gen_id, part } => {
-                write!(formatter, "Proposal({} - {:?})", key_gen_id, part)
+                write!(formatter, "Proposal({} {} - {:?})", key_gen_id.0, key_gen_id.1, part)
             }
             Message::Complaint {
                 key_gen_id, target, ..
-            } => write!(formatter, "Complaint({} - {})", key_gen_id, target),
+            } => write!(formatter, "Complaint({} {} - {} {})", key_gen_id.0, key_gen_id.1, target.0, target.1),
             Message::Justification { key_gen_id, .. } => {
-                write!(formatter, "Justification({})", key_gen_id)
+                write!(formatter, "Justification({} {})", key_gen_id.0, key_gen_id.1)
             }
             Message::Acknowledgment { key_gen_id, ack } => {
-                write!(formatter, "Acknowledgment({} - {:?})", key_gen_id, ack)
+                write!(formatter, "Acknowledgment({} {} - {:?})", key_gen_id.0, key_gen_id.1, ack)
             }
         }
     }

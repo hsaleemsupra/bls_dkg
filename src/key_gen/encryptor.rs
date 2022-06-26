@@ -45,14 +45,16 @@ pub struct Encryptor {
 }
 
 impl Encryptor {
-    pub fn new(peers: &BTreeSet<XorName>) -> Self {
+    pub fn new(tribe: &Vec<BTreeSet<XorName>>) -> Self {
         let mut keys_map = BTreeMap::new();
         // let mut rng = rand::thread_rng();
         // let mut rng_adaptor = RngAdapter(&mut rng);
-        for name in peers.iter() {
-            let key = Key(rand::thread_rng().gen());
-            let iv = Iv(rand::thread_rng().gen());
-            let _ = keys_map.insert(*name, (key, iv));
+        for clan in tribe.iter() {
+            for member in clan.iter(){
+                let key = Key(rand::thread_rng().gen());
+                let iv = Iv(rand::thread_rng().gen());
+                let _ = keys_map.insert(*member, (key, iv));
+            }
         }
         Encryptor { keys_map }
     }

@@ -16,7 +16,7 @@ pub struct Outcome {
     /// Secret Key share.
     pub secret_key_share: SecretKeyShare,
     /// Our index in the group
-    pub index: usize,
+    pub index: (usize, usize),
 }
 
 impl Outcome {
@@ -24,7 +24,7 @@ impl Outcome {
     pub fn new(
         public_key_set: PublicKeySet,
         secret_key_share: SecretKeyShare,
-        index: usize,
+        index: (usize, usize),
     ) -> Self {
         Self {
             public_key_set,

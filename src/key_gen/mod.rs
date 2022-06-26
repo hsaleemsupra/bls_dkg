@@ -12,10 +12,11 @@ mod rng_adapter;
 #[cfg(test)]
 mod tests;
 
+
 use bincode::{self, deserialize, serialize};
 use blsttc::{
     group::{ff::Field, prime::PrimeCurveAffine},
-    poly::{BivarCommitment, BivarPoly, Poly},
+    poly::{Poly,BivariatePolynomial},
     serde_impl::FieldWrap,
     Fr, G1Affine,
 };
@@ -25,12 +26,15 @@ use message::Message;
 use outcome::Outcome;
 use rand::{self, RngCore};
 use serde_derive::{Deserialize, Serialize};
-use std::collections::{btree_map::Entry, BTreeMap, BTreeSet};
+use std::collections::{btree_map::Entry};
 use std::{
     fmt::{self, Debug, Formatter},
     mem,
     ops::{AddAssign, Mul},
 };
+use std::collections::btree_map::BTreeMap;
+use std::collections::btree_set::BTreeSet;
+use blsttc::poly::Commitment;
 use xor_name::XorName;
 
 /// A local error while handling a message, that was not caused by that message being invalid.
@@ -40,6 +44,9 @@ pub enum Error {
     /// Unknown error.
     #[error("Unknown")]
     Unknown,
+    /// Invalid threshold error.
+    #[error("Invalid threshold")]
+    InvalidThreshold,
     /// Unknown sender.
     #[error("Unknown sender")]
     UnknownSender,
@@ -70,24 +77,24 @@ impl From<Box<bincode::ErrorKind>> for Error {
 }
 
 /// A contribution by a node for the key generation. The part shall only be handled by the receiver.
-#[derive(Deserialize, Serialize, Clone, Hash, Eq, PartialEq, PartialOrd, Ord)]
+#[derive(Deserialize, Serialize, Clone, Hash, Eq, PartialEq)]
 pub struct Part {
     // Index of the peer that expected to receive this Part.
-    receiver: u64,
+    receiver: (u64, u64),
     // Our poly-commitment.
-    commitment: BivarCommitment,
-    // serialized row for the receiver.
-    ser_row: Vec<u8>,
-    // Encrypted rows from the sender.
-    enc_rows: Vec<Vec<u8>>,
+    commitment: Commitment,
+    // point evaluation for the receiver
+    point_eval: Vec<u8>,
+    // encrypted shares of all clan members
+    enc_points: Vec<Vec<u8>>,
 }
 
 impl Debug for Part {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_tuple("Part")
-            .field(&format!("<receiver {}>", &self.receiver))
+            .field(&format!("<receiver {}, {}>", &self.receiver.0, &self.receiver.1))
             .field(&format!("<degree {}>", self.commitment.degree()))
-            .field(&format!("<{} rows>", self.enc_rows.len()))
+            .field(&format!("<{} enc points size>", self.enc_points.len()))
             .finish()
     }
 }
@@ -115,43 +122,35 @@ impl Debug for Acknowledgment {
 #[derive(Debug, PartialEq, Eq)]
 struct ProposalState {
     /// The proposer's commitment.
-    commitment: BivarCommitment,
+    commitment: Commitment,
     /// The verified values we received from `Acknowledgment` messages.
-    values: BTreeMap<u64, Fr>,
-    /// The encrypted values received from the proposor.
-    enc_values: Vec<Vec<u8>>,
-    /// The nodes which have committed.
-    acks: BTreeSet<u64>,
+    value: Fr,
+    // encrypted shares of all clan members
+    enc_points: Vec<Vec<u8>>,
 }
 
 impl ProposalState {
     /// Creates a new part state with a commitment.
-    fn new(commitment: BivarCommitment) -> ProposalState {
+    fn new(commitment: Commitment) -> ProposalState {
         ProposalState {
             commitment,
-            values: BTreeMap::new(),
-            enc_values: Vec::new(),
-            acks: BTreeSet::new(),
+            value: Fr::zero(),
+            enc_points: Vec::new(),
         }
     }
 
     fn is_complete(&self, threshold: usize) -> bool {
-        self.acks.len() > threshold
+        self.enc_points.len() > threshold
     }
 }
 
 impl<'a> serde::Deserialize<'a> for ProposalState {
     fn deserialize<D: serde::Deserializer<'a>>(deserializer: D) -> Result<Self, D::Error> {
-        let (commitment, values, enc_values, acks) = serde::Deserialize::deserialize(deserializer)?;
-        let values: Vec<(u64, FieldWrap<Fr>)> = values;
+        let (commitment, value, enc_points) = serde::Deserialize::deserialize(deserializer)?;
         Ok(Self {
             commitment,
-            values: values
-                .into_iter()
-                .map(|(index, fr)| (index, fr.0))
-                .collect(),
-            enc_values,
-            acks,
+            value,
+            enc_points,
         })
     }
 }
@@ -178,13 +177,15 @@ pub enum Phase {
 
 #[derive(Default)]
 struct InitializationAccumulator {
-    senders: BTreeSet<u64>,
-    initializations: BTreeMap<(usize, usize, BTreeSet<XorName>), usize>,
+    clans: usize,
+    senders: BTreeSet<(u64,u64)>,
+    initializations: BTreeMap<(u64, usize, usize, usize, usize, Vec<BTreeSet<XorName>>), usize>,
 }
 
 impl InitializationAccumulator {
-    fn new() -> InitializationAccumulator {
+    fn new(clans:usize) -> InitializationAccumulator {
         InitializationAccumulator {
+            clans,
             senders: BTreeSet::new(),
             initializations: BTreeMap::new(),
         }
@@ -193,37 +194,68 @@ impl InitializationAccumulator {
     fn add_initialization(
         &mut self,
         // Following the `m of n` terminology, here m is the threshold and n is the total number.
-        m: usize,
-        n: usize,
-        sender: u64,
-        member_list: BTreeSet<XorName>,
-    ) -> Option<(usize, usize, BTreeSet<XorName>)> {
+        m1: usize,
+        n1: usize,
+        m2: usize,
+        n2: usize,
+        sender: (u64, u64),
+        member_list: Vec<BTreeSet<XorName>>,
+    ) -> Option<(u64, usize, usize, usize, usize, Vec<BTreeSet<XorName>>)> {
+
+        if sender.0 as usize >= self.clans{
+            return None;
+        }
+
         if !self.senders.insert(sender) {
             return None;
         }
 
-        let paras = (m, n, member_list);
+        let mut paras = (sender.0, m1, n1, m2, n2, member_list);
         let value = self.initializations.entry(paras.clone()).or_insert(0);
         *value += 1;
 
-        if *value >= m {
+        //check of threshold number of clans have correct tribe configuration
+        let mut total_valid_clans = 0;
+
+        for i in 0..self.clans{
+            paras.0 = i as u64;
+            let value = self.initializations.entry(paras.clone()).or_insert(0);
+            if *value >= m2 {
+                total_valid_clans = total_valid_clans + 1;
+            }
+        }
+
+        if total_valid_clans >= m1{
             Some(paras)
-        } else {
+        }
+        else{
             None
         }
+
     }
 }
 
 #[derive(Default)]
 struct ComplaintsAccumulator {
     names: BTreeSet<XorName>,
-    threshold: usize,
+    threshold: (usize, usize),
     // Indexed by complaining targets.
     complaints: BTreeMap<XorName, BTreeSet<XorName>>,
 }
 
 impl ComplaintsAccumulator {
-    fn new(names: BTreeSet<XorName>, threshold: usize) -> ComplaintsAccumulator {
+    fn new(tribe: Vec<BTreeSet<XorName>>, threshold: (usize, usize)) -> ComplaintsAccumulator {
+
+        let mut names = BTreeSet::new();
+
+        for i in 0..tribe.len() {
+            let clan: Vec<_> = tribe[i].iter().cloned().collect();
+            for j in 0..clan.len(){
+                names.insert(clan[j]);
+            }
+        }
+
+
         ComplaintsAccumulator {
             names,
             threshold,
@@ -259,7 +291,7 @@ impl ComplaintsAccumulator {
         let mut counts: BTreeMap<XorName, usize> = BTreeMap::new();
 
         for (target_id, accusers) in self.complaints.iter() {
-            if accusers.len() > self.names.len() - self.threshold {
+            if accusers.len() > self.names.len() - self.threshold.0 * self.threshold.1  {
                 let _ = invalid_peers.insert(*target_id);
                 for peer in self.names.iter() {
                     if !accusers.contains(peer) {
@@ -299,16 +331,22 @@ pub type MessageAndTarget = (XorName, Message);
 pub struct KeyGen {
     /// Our node ID.
     our_id: XorName,
-    /// Our node index.
-    our_index: u64,
+    /// Our node index in a clan.
+    our_index: (u64, u64),
     /// The names of all nodes, by node ID.
-    names: BTreeSet<XorName>,
+    tribe: Vec<BTreeSet<XorName>>,
+    /// Total members in the tribe
+    total_members: usize,
     /// Carry out encryption work during the DKG process.
     encryptor: Encryptor,
     /// Proposed bivariate polynomials.
-    parts: BTreeMap<u64, ProposalState>,
-    /// The degree of the generated polynomial.
-    threshold: usize,
+    parts: BTreeMap<(u64, u64), ProposalState>,
+    /// Minimum number of clans required to compute tribe level keys
+    /// Polynomial x degree = tribe_threshold - 1
+    tribe_threshold: usize,
+    /// Minimum number of clan members required to compute clan level keys
+    /// Polynomial y degree = clan_threshold - 1
+    clan_threshold: usize,
     /// Current DKG phase.
     phase: Phase,
     /// Accumulates initializations.
@@ -326,39 +364,75 @@ impl KeyGen {
     /// multicast to all nodes.
     pub fn initialize(
         our_id: XorName,
-        threshold: usize,
-        names: BTreeSet<XorName>,
+        total_clans: usize,
+        tribe_threshold: usize,
+        members_per_clan: usize,
+        clan_threshold: usize,
+        tribe: Vec<BTreeSet<XorName>>,
     ) -> Result<(KeyGen, Vec<MessageAndTarget>), Error> {
-        if names.len() < threshold {
+
+        if tribe.len() < tribe_threshold {
             return Err(Error::Unknown);
         }
-        let our_index = if let Some(index) = names.iter().position(|id| *id == our_id) {
-            index as u64
-        } else {
+
+        for clan in &tribe{
+            if (*clan).len()<clan_threshold{
+                return Err(Error::Unknown);
+            }
+        }
+
+        let mut clan_index: i32  = -1;
+        let mut member_index: i32  = -1;
+        let mut total_mem :usize = 0;
+
+
+        for i in 0..tribe.len() {
+            let clan: Vec<_> = tribe[i].iter().cloned().collect();
+            for j in 0..clan.len(){
+                total_mem = total_mem+1;
+
+                if clan[j] == our_id{
+                    clan_index = i as i32;
+                    member_index = j as i32;
+                }
+            }
+        }
+
+        if clan_index == -1 || member_index == -1 {
             return Err(Error::Unknown);
-        };
+        }
 
         let key_gen = KeyGen {
             our_id,
-            our_index,
-            names: names.clone(),
-            encryptor: Encryptor::new(&names),
+            our_index: ((clan_index) as u64, (member_index) as u64),
+            tribe: tribe.clone(),
+            total_members: total_mem,
+            encryptor: Encryptor::new(&tribe),
             parts: BTreeMap::new(),
-            threshold,
+            tribe_threshold,
+            clan_threshold,
             phase: Phase::Initialization,
-            initalization_accumulator: InitializationAccumulator::new(),
-            complaints_accumulator: ComplaintsAccumulator::new(names.clone(), threshold),
+            initalization_accumulator: InitializationAccumulator::new(total_clans),
+            complaints_accumulator: ComplaintsAccumulator::new(tribe.clone(), (tribe_threshold, clan_threshold)),
             pending_complain_messages: Vec::new(),
             message_cache: BTreeMap::new(),
         };
 
         let msg = Message::Initialization {
-            key_gen_id: our_index,
-            m: threshold,
-            n: names.len(),
-            member_list: names.clone(),
+            key_gen_id: ((clan_index) as u64, (member_index) as u64),
+            m1: tribe_threshold,
+            n1: total_clans,
+            m2: clan_threshold,
+            n2: members_per_clan,
+            member_list: tribe.clone(),
         };
-        let messages: Vec<_> = names.iter().map(|name| (*name, msg.clone())).collect();
+
+        let mut messages: Vec<MessageAndTarget> = vec![];
+        for x in tribe {
+            for y in x {
+                messages.push((y, msg.clone()));
+            }
+        }
 
         Ok((key_gen, messages))
     }
@@ -447,7 +521,7 @@ impl KeyGen {
                 warn!(
                     "cannot get name of index {:?} among {:?}",
                     msg.creator(),
-                    self.names
+                    self.tribe
                 );
                 continue;
             };
@@ -471,12 +545,14 @@ impl KeyGen {
         let result = match msg.clone() {
             Message::Initialization {
                 key_gen_id,
-                m,
-                n,
+                m1,
+                n1,
+                m2,
+                n2,
                 member_list,
             } => {
                 let _ = self.message_cache.insert(msg.id(), msg);
-                self.handle_initialization(rng, m, n, key_gen_id, member_list)
+                self.handle_initialization(rng, m1, n1, m2, n2,  key_gen_id, member_list)
             }
             Message::Proposal { key_gen_id, part } => self.handle_proposal(key_gen_id, part),
             Message::Complaint {
@@ -493,59 +569,68 @@ impl KeyGen {
         self.multicasting_messages(result?)
     }
 
-    // Handles an incoming initialize message. Creates the `Proposal` message once quorumn
+    // Handles an incoming initialize message. Creates the `Proposal` message once quorum
     // agreement reached, and the message should be multicast to all nodes.
     fn handle_initialization<R: RngCore>(
         &mut self,
         rng: &mut R,
-        m: usize,
-        n: usize,
-        sender: u64,
-        member_list: BTreeSet<XorName>,
+        m1: usize,
+        n1: usize,
+        m2: usize,
+        n2: usize,
+        sender: (u64, u64),
+        member_list: Vec<BTreeSet<XorName>>,
     ) -> Result<Vec<Message>, Error> {
         if self.phase != Phase::Initialization {
             return Ok(Vec::new());
         }
 
-        if let Some((m, _n, member_list)) =
+        if let Some((_sender_clan, m1, _n1, m2, _n2,  member_list)) =
             self.initalization_accumulator
-                .add_initialization(m, n, sender, member_list)
+                .add_initialization(m1, n1, m2, n2, sender, member_list)
         {
-            self.threshold = m;
-            self.names = member_list;
+
+            self.tribe_threshold = m1;
+            self.clan_threshold = m2;
+            self.tribe = member_list;
             self.phase = Phase::Contribution;
 
             let mut rng = rng_adapter::RngAdapter(&mut *rng);
-            let our_part = BivarPoly::random(self.threshold, &mut rng);
-            let ack = our_part.commitment();
-            let encrypt = |(i, name): (usize, &XorName)| {
-                let row = our_part.row(i + 1);
-                self.encryptor.encrypt(name, &serialize(&row)?)
-            };
-            let rows = self
-                .names
-                .iter()
-                .enumerate()
-                .map(encrypt)
-                .collect::<Result<Vec<_>, Error>>()?;
-            let result = self
-                .names
-                .iter()
-                .enumerate()
-                .map(|(idx, _pk)| {
-                    let ser_row = serialize(&our_part.row(idx + 1))?;
-                    Ok(Message::Proposal {
-                        key_gen_id: self.our_index,
-                        part: Part {
-                            receiver: idx as u64,
-                            commitment: ack.clone(),
-                            ser_row,
-                            enc_rows: rows.clone(),
-                        },
-                    })
-                })
-                .collect::<Result<Vec<_>, Error>>()?;
+            let our_part = BivariatePolynomial::random(m1-1, m2-1, &mut rng);
+            let mut result: Vec<Message> = Vec::new();
+
+            for i in 0..self.tribe.len() {
+
+                let univar_poly = our_part.get_univariate_poly( i+1);
+                let univar_commitment = univar_poly.commitment();
+
+                let mut values = Vec::new();
+                let mut enc_values = Vec::new();
+
+                let clan: Vec<_> = self.tribe[i].iter().cloned().collect();
+                for j in 0..clan.len(){
+                    let eval = univar_poly.evaluate(j+1);
+                    let ser_val = serialize(&FieldWrap(eval))?;
+                    enc_values.push(self.encryptor.encrypt(&clan[j], &ser_val)?);
+                    values.push(ser_val);
+                }
+
+                for j in 0..clan.len(){
+                    result.push(
+                        Message::Proposal {
+                            key_gen_id: self.our_index,
+                            part: Part {
+                                receiver: (i as u64, j as u64),
+                                commitment: univar_commitment.clone(),
+                                point_eval: values[j].clone(),
+                                enc_points: enc_values.clone()}
+                        })
+                }
+
+            }
+
             return Ok(result);
+
         }
         Ok(Vec::new())
     }
@@ -553,7 +638,7 @@ impl KeyGen {
     // Handles a `Proposal` message during the `Contribution` phase.
     // When there is an invalidation happens, holds the `Complaint` message till broadcast out
     // when `finalize_contributing` being called.
-    fn handle_proposal(&mut self, sender_index: u64, part: Part) -> Result<Vec<Message>, Error> {
+    fn handle_proposal(&mut self, sender_index: (u64, u64), part: Part) -> Result<Vec<Message>, Error> {
         if self.phase == Phase::Initialization {
             return Err(Error::UnexpectedPhase {
                 expected: Phase::Contribution,
@@ -563,8 +648,8 @@ impl KeyGen {
             return Ok(Vec::new());
         }
 
-        let row = match self.handle_part_or_fault(sender_index, part.clone()) {
-            Ok(Some(row)) => row,
+        let _point_eval = match self.handle_part_or_fault(sender_index, part.clone()) {
+            Ok(Some(_point_eval)) => return Ok(Vec::new()),
             Ok(None) => return Ok(Vec::new()),
             Err(_fault) => {
                 let msg = Message::Proposal {
@@ -585,31 +670,7 @@ impl KeyGen {
             }
         };
 
-        // The row is valid. Encrypt one value for each node and broadcast `Acknowledgment`.
-        let mut values = Vec::new();
-        let mut enc_values = Vec::new();
-        for (index, pk) in self.names.iter().enumerate() {
-            let val = row.evaluate(index + 1);
-            let ser_val = serialize(&FieldWrap(val))?;
-            enc_values.push(self.encryptor.encrypt(pk, &ser_val)?);
-            values.push(ser_val);
-        }
 
-        let result = self
-            .names
-            .iter()
-            .enumerate()
-            .map(|(idx, _pk)| Message::Acknowledgment {
-                key_gen_id: self.our_index,
-                ack: Acknowledgment(
-                    sender_index,
-                    idx as u64,
-                    values[idx].clone(),
-                    enc_values.clone(),
-                ),
-            })
-            .collect();
-        Ok(result)
     }
 
     // Handles an `Acknowledgment` message during the `Contribution` phase.
@@ -617,7 +678,7 @@ impl KeyGen {
     // when `finalize_contributing` being called.
     fn handle_ack(
         &mut self,
-        sender_index: u64,
+        sender_index: (u64, u64),
         ack: Acknowledgment,
     ) -> Result<Vec<Message>, Error> {
         if self.phase == Phase::Initialization {
@@ -669,11 +730,11 @@ impl KeyGen {
     }
 
     pub fn all_contribution_received(&self) -> bool {
-        self.names.len() == self.parts.len()
+        self.total_members == self.parts.len()
             && self
                 .parts
                 .values()
-                .all(|part| part.acks.len() == self.names.len())
+                .all(|part| part.enc_points.len() == self.total_members)
     }
 
     fn finalize_contributing_phase(&mut self) -> Vec<Message> {
@@ -691,12 +752,13 @@ impl KeyGen {
             });
         }
         debug!(
-            "{:?} has {:?} complain message and is {:?} ready ({:?} - {:?})",
+            "{:?} has {:?} complain message and is {:?} ready ({:?} - {:?} {:?})",
             self,
             self.pending_complain_messages.len(),
             self.is_ready(),
             self.complete_parts_count(),
-            self.threshold,
+            self.tribe_threshold,
+            self.clan_threshold,
         );
         // In case of ready, transit into `Finalization` phase.
         if self.is_ready() {
@@ -706,25 +768,32 @@ impl KeyGen {
         mem::take(&mut self.pending_complain_messages)
     }
 
-    fn non_contributors(&self) -> (BTreeSet<u64>, BTreeSet<XorName>) {
+    fn non_contributors(&self) -> (BTreeSet<(u64, u64)>, BTreeSet<XorName>) {
         let mut non_idxes = BTreeSet::new();
         let mut non_ids = BTreeSet::new();
-        let mut missing_times = BTreeMap::new();
-        for (idx, name) in self.names.iter().enumerate() {
-            if let Some(proposal_sate) = self.parts.get(&(idx as u64)) {
-                if !proposal_sate.acks.contains(&(idx as u64)) {
-                    let times = missing_times.entry(idx).or_insert_with(|| 0);
-                    *times += 1;
-                    if *times > self.names.len() / 2 {
-                        let _ = non_idxes.insert(idx as u64);
-                        let _ = non_ids.insert(*name);
+
+        for i in 0..self.tribe.len() {
+            let clan: Vec<_> = self.tribe[i].iter().cloned().collect();
+            for j in 0..clan.len(){
+
+                if let Some(proposal_sate) = self.parts.get(&( (i+1) as u64, (j+1) as u64) ) {
+
+                    if proposal_sate.enc_points.len() < self.clan_threshold {
+                        let _ = non_idxes.insert(((i+1) as u64, (j+1) as u64));
+                        let _ = non_ids.insert(clan[j]);
                     }
+
                 }
-            } else {
-                let _ = non_idxes.insert(idx as u64);
-                let _ = non_ids.insert(*name);
+
+                else {
+                    let _ = non_idxes.insert(((i+1) as u64, (j+1) as u64));
+                    let _ = non_ids.insert(clan[j]);
+                }
+
             }
         }
+
+
         (non_idxes, non_ids)
     }
 
@@ -773,13 +842,14 @@ impl KeyGen {
                     } else {
                         warn!(
                             "For a Proposal, Cannot get name of index {:?} among {:?}",
-                            part.receiver, self.names
+                            part.receiver, self.tribe
                         );
                         continue;
                     };
                     messaging.push((receiver, message));
                 }
                 Message::Acknowledgment { ref ack, .. } => {
+                    /*
                     let receiver = if let Some(name) = self.node_id_from_index(ack.1) {
                         name
                     } else {
@@ -789,11 +859,15 @@ impl KeyGen {
                         );
                         continue;
                     };
-                    messaging.push((receiver, message));
+                    messaging.push((receiver, message));*/
                 }
                 _ => {
-                    for name in &self.names {
-                        messaging.push((*name, message.clone()));
+
+                    for i in 0..self.tribe.len() {
+                        let clan: Vec<_> = self.tribe[i].iter().cloned().collect();
+                        for j in 0..clan.len(){
+                            messaging.push((clan[j], message.clone()));
+                        }
                     }
                 }
             }
@@ -804,8 +878,8 @@ impl KeyGen {
     // Handles a `Complaint` message.
     fn handle_complaint(
         &mut self,
-        sender_index: u64,
-        target_index: u64,
+        sender_index: (u64, u64),
+        target_index: (u64, u64),
         invalid_msg: Vec<u8>,
     ) -> Result<Vec<Message>, Error> {
         if self.phase != Phase::Complaining {
@@ -829,6 +903,11 @@ impl KeyGen {
         &mut self,
         rng: &mut R,
     ) -> Result<Vec<Message>, Error> {
+
+        let mut result = Vec::new();
+
+        /*
+
         let failings = self.complaints_accumulator.finalize_complaining_phase();
 
         if failings.len() >= self.names.len() - self.threshold {
@@ -842,7 +921,6 @@ impl KeyGen {
             return Err(Error::TooManyNonVoters(result));
         }
 
-        let mut result = Vec::new();
         // Sending out a Justification message if find self is failed.
         if failings.contains(&self.our_id) {
             result.push(Message::Justification {
@@ -897,7 +975,7 @@ impl KeyGen {
                     },
                 });
             }
-        });
+        });*/
 
         Ok(result)
     }
@@ -905,7 +983,7 @@ impl KeyGen {
     // Handles a `Justification` message.
     fn handle_justification(
         &mut self,
-        _sender_index: u64,
+        _sender_index: (u64, u64),
         _keys_map: BTreeMap<XorName, (Key, Iv)>,
     ) -> Result<Vec<Message>, Error> {
         // TODO: Need to decide how the justification and recover procedure take out.
@@ -918,18 +996,29 @@ impl KeyGen {
     }
 
     /// Returns the index of the node, or `None` if it is unknown.
-    fn node_index(&self, node_id: &XorName) -> Option<u64> {
-        self.names
-            .iter()
-            .position(|id| id == node_id)
-            .map(|index| index as u64)
+    fn node_index(&self, node_id: &XorName) -> Option<(u64, u64)> {
+
+        for i in 0..self.tribe.len() {
+            let clan: Vec<_> = self.tribe[i].iter().cloned().collect();
+            for j in 0..clan.len(){
+                if *node_id == clan[j]{
+                    return Some(( i as u64, j as u64));
+                }
+            }
+        }
+        None
+
     }
 
     /// Returns the id of the index, or `None` if it is unknown.
-    pub fn node_id_from_index(&self, node_index: u64) -> Option<XorName> {
-        for (i, name) in self.names.iter().enumerate() {
-            if i == node_index as usize {
-                return Some(*name);
+    pub fn node_id_from_index(&self, node_index: (u64, u64)) -> Option<XorName> {
+
+        for i in 0..self.tribe.len() {
+            let clan: Vec<_> = self.tribe[i].iter().cloned().collect();
+            for j in 0..clan.len(){
+                if i == (node_index.0) as usize && j == (node_index.1) as usize{
+                    return Some(clan[j]);
+                }
             }
         }
         None
@@ -940,13 +1029,13 @@ impl KeyGen {
     fn complete_parts_count(&self) -> usize {
         self.parts
             .values()
-            .filter(|part| part.is_complete(self.threshold))
+            .filter(|part| part.is_complete(self.clan_threshold))
             .count()
     }
 
     // Returns `true` if all parts are complete to safely generate the new key.
     fn is_ready(&self) -> bool {
-        self.complete_parts_count() == self.names.len()
+        self.complete_parts_count() == self.total_members
     }
 
     /// Returns `true` if in the phase of Finalization.
@@ -956,31 +1045,38 @@ impl KeyGen {
         if !result {
             trace!("incompleted DKG session containing:");
             for (key, part) in self.parts.iter() {
-                let acks: Vec<u64> = part.values.keys().cloned().collect();
-                trace!("    Part from {:?}, and acks from {:?}", key, acks);
+                let val = part.value;
+                trace!("    Part from {:?}, and acks from {:?}", key, val);
             }
         }
         result
     }
 
     /// Returns the new secret key share and the public key set.
-    pub fn generate_keys(&self) -> Option<(BTreeSet<XorName>, Outcome)> {
+    pub fn generate_keys(&self) -> Option<(Vec<BTreeSet<XorName>>, Outcome)> {
         if !self.is_finalized() {
             return None;
         }
 
         let mut pk_commitment = Poly::zero().commitment();
         let mut sk_val = Fr::zero();
-        let is_complete = |part: &&ProposalState| part.is_complete(self.threshold);
+        let is_complete = |part: &&ProposalState| part.is_complete(self.clan_threshold);
         for part in self.parts.values().filter(is_complete) {
-            pk_commitment += part.commitment.row(0);
-            let row = Poly::interpolate(part.values.iter().take(self.threshold + 1)).ok()?;
-            sk_val.add_assign(&row.evaluate(0));
+            pk_commitment += part.commitment.clone();
+            sk_val.add_assign(&part.value);
         }
+
+        if pk_commitment.evaluate(self.our_index.1 + 1)
+            != G1Affine::generator().mul(sk_val)
+        {
+            return None;
+        }
+
         let sk = SecretKeyShare::from_mut(&mut sk_val);
+
         Some((
-            self.names.clone(),
-            Outcome::new(pk_commitment.into(), sk, self.our_index as usize),
+            self.tribe.clone(),
+            Outcome::new(pk_commitment.into(), sk, (self.our_index.0 as usize, self.our_index.1 as usize) ),
         ))
     }
 
@@ -989,7 +1085,7 @@ impl KeyGen {
     /// any and provable.
     pub fn possible_blockers(&self) -> BTreeSet<XorName> {
         let mut result = BTreeSet::new();
-        match self.phase {
+        /*match self.phase {
             Phase::Initialization => {
                 for (index, name) in self.names.iter().enumerate() {
                     if !self
@@ -1021,24 +1117,22 @@ impl KeyGen {
             Phase::Finalization => {
                 // Not blocking
             }
-        }
+        }*/
         result
     }
 
     /// Handles a `Part`, returns a `PartFault` if it is invalid.
     fn handle_part_or_fault(
         &mut self,
-        sender_index: u64,
+        sender_index: (u64, u64),
         Part {
             receiver,
             commitment,
-            ser_row,
-            enc_rows,
+            point_eval,
+            enc_points,
         }: Part,
-    ) -> Result<Option<Poly>, PartFault> {
-        if enc_rows.len() != self.names.len() {
-            return Err(PartFault::RowCount);
-        }
+    ) -> Result<Option<Fr>, PartFault> {
+
         if receiver != self.our_index {
             return Ok(None);
         }
@@ -1048,25 +1142,41 @@ impl KeyGen {
             }
             return Ok(None); // We already handled this `Part` before.
         }
-        let ack_row = commitment.row(self.our_index + 1);
-        // Retrieve our own row's commitment, and store the full commitment.
+
+        let val = deserialize::<FieldWrap<Fr>>(&point_eval)
+            .map_err(|_| PartFault::DeserializeValue)?
+            .into_inner();
+
+        if commitment.evaluate(self.our_index.1 + 1)
+            != G1Affine::generator().mul(val)
+        {
+            return Err(PartFault::ShareVerify);
+        }
+
         let _ = self
             .parts
             .insert(sender_index, ProposalState::new(commitment));
 
-        let row: Poly = deserialize(&ser_row).map_err(|_| PartFault::DeserializeRow)?;
-        if row.commitment() != ack_row {
-            return Err(PartFault::RowAcknowledgment);
-        }
-        Ok(Some(row))
+        let part = self
+            .parts
+            .get_mut(&sender_index)
+            .ok_or(PartFault::MissingPart)?;
+
+        let _ = part.value = val;
+        let _ = part.enc_points = enc_points;
+
+
+        Ok(Some(val))
     }
 
     /// Handles an acknowledgment.
     fn handle_ack_or_fault(
         &mut self,
-        sender_index: u64,
+        sender_index: (u64, u64),
         Acknowledgment(proposer_index, receiver_index, ser_val, values): Acknowledgment,
     ) -> Result<(), AcknowledgmentFault> {
+        /*
+
         if values.len() != self.names.len() {
             return Err(AcknowledgmentFault::ValueCount);
         }
@@ -1100,7 +1210,7 @@ impl KeyGen {
                 .get_mut(&sender_index)
                 .ok_or(AcknowledgmentFault::MissingPart)?;
             part.enc_values = values;
-        }
+        }*/
 
         Ok(())
     }
@@ -1115,29 +1225,42 @@ impl Debug for KeyGen {
 #[cfg(test)]
 impl KeyGen {
     /// Returns the name list of the final participants.
-    pub fn names(&self) -> &BTreeSet<XorName> {
-        &self.names
+    pub fn names(&self) -> &Vec<BTreeSet<XorName>> {
+        &self.tribe
     }
 
     /// Initialize an instance with some pre-defined value, only for testing usage.
     pub fn initialize_for_test(
         our_id: XorName,
-        our_index: u64,
-        names: BTreeSet<XorName>,
-        threshold: usize,
+        total_clans: usize,
+        tribe_threshold: usize,
+        clan_threshold: usize,
+        our_index: (u64, u64),
+        tribe: Vec<BTreeSet<XorName>>,
         phase: Phase,
     ) -> KeyGen {
-        assert!(names.len() >= threshold);
+        assert!(tribe.len() >= tribe_threshold);
+
+        let mut total_members :usize = 0;
+
+        for clan in &tribe{
+            total_members = total_members + clan.len();
+            assert!((*clan).len() >= clan_threshold);
+        }
+
+
         KeyGen {
             our_id,
             our_index,
-            names: names.clone(),
-            encryptor: Encryptor::new(&names),
+            tribe: tribe.clone(),
+            total_members,
+            encryptor: Encryptor::new(&tribe),
             parts: BTreeMap::new(),
-            threshold,
+            tribe_threshold,
+            clan_threshold,
             phase,
-            initalization_accumulator: InitializationAccumulator::new(),
-            complaints_accumulator: ComplaintsAccumulator::new(names, threshold),
+            initalization_accumulator: InitializationAccumulator::new(total_clans),
+            complaints_accumulator: ComplaintsAccumulator::new(tribe.clone(), (tribe_threshold, clan_threshold)),
             pending_complain_messages: Vec::new(),
             message_cache: BTreeMap::new(),
         }
@@ -1173,9 +1296,19 @@ pub enum AcknowledgmentFault {
     Clone, Copy, Eq, thiserror::Error, PartialEq, Debug, Serialize, Deserialize, PartialOrd, Ord,
 )]
 pub enum PartFault {
+
+    ///Share verification fails
+    #[error("Verification of point share using the commitment fails")]
+    ShareVerify,
+    /// No corresponding Part received.
+    #[error("No corresponding Part received")]
+    MissingPart,
     /// The number of rows differs from the number of nodes.
     #[error("The number of rows differs from the number of nodes")]
     RowCount,
+    /// Value deserialization failed.
+    #[error("Value deserialization failed")]
+    DeserializeValue,
     /// Received multiple different Part messages from the same sender.
     #[error("Received multiple different Part messages from the same sender")]
     MultipleParts,
