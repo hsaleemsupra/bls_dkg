@@ -377,6 +377,29 @@ impl Poly {
         }
     }
 
+    /// Returns the corresponding Pedersen commitment.
+    pub fn pedersen_commitment(&self, poly_b: &Poly, h: G1) -> Commitment {
+
+        if self.coeff.len() != poly_b.coeff.len() {
+            return Commitment {coeff:  Vec::new()};
+        }
+
+        let mut commitment_coeffs: Vec<G1> = Vec::new();
+
+        for i in 0..self.coeff.len(){
+
+            let pedersen_coeff = G1Affine::generator().mul(self.coeff.get(i).unwrap()) +
+                    h.mul(poly_b.coeff.get(i).unwrap());
+
+            commitment_coeffs.push(pedersen_coeff);
+
+        }
+
+        Commitment {
+            coeff: commitment_coeffs,
+        }
+    }
+
     /// Serializes to big endian bytes
     pub fn to_bytes(&self) -> Vec<u8> {
         let coeff_size = self.coeff.len();
@@ -598,6 +621,7 @@ impl Commitment {
         self.coeff.truncate(len)
     }
 }
+
 
 
 /// Our custom bivar implementation
@@ -856,6 +880,10 @@ impl BivariatePolynomial {
                 degree_x, degree_y, e
             )
         })
+    }
+
+    pub fn zero() -> Self {
+        BivariatePolynomial { degree_x: 0, degree_y: 0, coeff: vec![] }
     }
 
     /// Removes all trailing zero coefficients.

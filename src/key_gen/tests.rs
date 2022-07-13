@@ -13,15 +13,18 @@ use blsttc::{PublicKey, PublicKeySet, SignatureShare};
 use itertools::Itertools;
 use rand::{Rng, RngCore};
 use std::collections::{BTreeMap, BTreeSet};
+use blsttc::blstrs::G1Projective;
+use blsttc::group::Group;
 use blsttc::poly::Poly;
 use xor_name::XorName;
-use crate::Phase::Commitment;
+
 
 // Alter the configure of the number of nodes and the threshold.
 const CLANS_PER_TRIBE: usize = 5;
 const NODES_PER_CLAN: usize = 5;
-const TRIBE_THRESHOLD: usize = 3;
-const CLAN_THRESHOLD: usize = 3;
+const TRIBE_THRESHOLD: usize = 2;
+const CLAN_THRESHOLD: usize = 2;
+
 
 fn setup_generators<R: RngCore>(
     mut rng: &mut R,
@@ -44,6 +47,12 @@ fn create_generators<R: RngCore>(
     // Generate individual key pairs.
     let mut tribe: Vec<BTreeSet<XorName>> = Vec::new();
 
+    // needed for pedersen commitments
+    // This h needs to be generated in a secure manner and same value of h is given to each node
+    // For now h is generated using a random number, however later we want to change it to h = H(g||i)
+    //todo: Change generation of h to use hashing.
+    let h = G1Projective::random(&mut rng);
+
     // Creating a tribe using PeerIds
     for i in 0..CLANS_PER_TRIBE{
         let mut clan: BTreeSet<XorName> = BTreeSet::new();
@@ -60,7 +69,7 @@ fn create_generators<R: RngCore>(
     for peer_id in peer_ids.iter() {
         let key_gen = {
             let (key_gen, messaging) =
-                match KeyGen::initialize(peer_id.name(), CLANS_PER_TRIBE, TRIBE_THRESHOLD, NODES_PER_CLAN, CLAN_THRESHOLD, tribe.clone()) {
+                match KeyGen::initialize(peer_id.name(), CLANS_PER_TRIBE, TRIBE_THRESHOLD, NODES_PER_CLAN, CLAN_THRESHOLD, tribe.clone(), h) {
                     Ok(result) => result,
                     Err(err) => {
                         return Err(format_err!(
@@ -131,13 +140,34 @@ fn all_nodes_being_responsive() -> Result<()> {
     let mut rng = rand::thread_rng();
     let (peer_ids, mut generators) = setup_generators(&mut rng, BTreeSet::new())?;
 
-    // With all participants responding properly, we need to call timed phase transition to move from
-    // contributing phase to finalization phase and then call the key generating procedure
-    peer_ids.iter().enumerate().for_each(|(index, _peer_id)| {
-        if let Ok(result) = generators[index].timed_phase_transition(&mut rng) {
-            assert!(result.is_empty());
-        }
-    });
+    // We need to call timed phase transition 4 times to move from:
+    // 1. pedersen contributing phase to pedersen complaining phase
+    // 2. pedersen complaining phase to feldman contribution phase
+    // 3. feldman contribution phase to feldman complaining phase
+    // 4. feldman complaining phase to finalization phase
+    // and then call the key generating procedure
+
+    let mut proposals = Vec::new();
+    for _ in 0..4 {
+        peer_ids.iter().enumerate().for_each(|(index, _peer_id)| {
+            if let Ok(proposal_vec) = generators[index].timed_phase_transition(&mut rng) {
+
+                for proposal in proposal_vec {
+                    proposals.push(proposal);
+                }
+
+            }
+        });
+
+        messaging(
+            &mut rng,
+            &mut generators,
+            &mut proposals,
+            BTreeSet::new(),
+        );
+        assert!(proposals.is_empty());
+    };
+
 
     //Generating keys
     /*assert!(generators
@@ -215,103 +245,128 @@ fn all_nodes_being_responsive() -> Result<()> {
     assert!(tribe_public_key.verify(&tribe_signature, msg));
 
 
-
-
-
-
-
-
-
-    /*let tribe_sig = match pub_key_set.combine_signatures(sig_shares.iter()) {
-        Ok(sig) => sig,
-        Err(e) => return Err(format_err!("Unexpected Error {:?}: Not able to generate Signature with THRESHOLD + 1 sig_shares", e)),
-    };*/
-
-
-
-
-
     Ok(())
 
 }
 
-/*
+
 #[test]
 fn having_max_unresponsive_nodes_still_work() -> Result<()> {
     let mut rng = rand::thread_rng();
-    let all_nodes: BTreeSet<_> = (0u64..NODENUM as u64).collect();
-    let combinations_of_non_resp = all_nodes
-        .iter()
-        .cloned()
-        .combinations(NODENUM - THRESHOLD - 1);
 
-    for non_responsive in combinations_of_non_resp {
-        let non_responsives: BTreeSet<u64> = non_responsive.iter().cloned().collect();
-        let (peer_ids, mut generators) = setup_generators(&mut rng, non_responsives.clone())?;
+    let mut rand_non_resp_nodes_combination = BTreeSet::new();
 
-        let mut proposals = Vec::new();
-        // With one non_responsive node, Proposal phase cannot be completed automatically. This
-        // requires finalize_contributing_phase to be called externally to complete the procedure.
-        // All participants will transit into Complaint phase afterwards, Then requires
-        // finalize_complaining_phase to be called externally to complete the procedure.
-        for _ in 0..2 {
-            peer_ids.iter().enumerate().for_each(|(index, _peer_id)| {
-                if let Ok(proposal_vec) = generators[index].timed_phase_transition(&mut rng) {
-                    if !non_responsives.contains(&(index as u64)) {
-                        for proposal in proposal_vec {
-                            proposals.push(proposal);
-                        }
-                    }
-                }
-            });
-            // Continue the procedure with messaging.
-            messaging(
-                &mut rng,
-                &mut generators,
-                &mut proposals,
-                non_responsives.clone(),
-            );
-            assert!(proposals.is_empty());
+    let mut start: u64 = 0;
+    let mut end: u64 = NODES_PER_CLAN as u64;
+
+    // creating a list of non-responsive nodes by taking at most NODES_PER_CLAN - CLAN_THRESHOLD - 1
+    // non-responsive nodes from each clan.
+
+    for _i in 0..CLANS_PER_TRIBE{
+        let all_nodes: BTreeSet<_> = (start..end).collect();
+
+        //taking the first combination only
+        let combinations_of_non_resp = all_nodes
+            .iter()
+            .cloned()
+            .combinations(NODES_PER_CLAN - CLAN_THRESHOLD - 1).take(1);
+
+
+        for non_reps in combinations_of_non_resp{
+            rand_non_resp_nodes_combination.append(&mut non_reps.iter().cloned().collect());
         }
 
-        let responsive = all_nodes
-            .difference(&non_responsives)
-            .cloned()
-            .collect_vec();
+        start = end;
+        end = end + NODES_PER_CLAN as u64;
 
-        let pub_key_set: PublicKeySet = generators[responsive[0] as usize]
+
+    }
+
+
+    let non_responsives: BTreeSet<u64> = rand_non_resp_nodes_combination.clone();
+    let (peer_ids, mut generators) = setup_generators(&mut rng, non_responsives.clone())?;
+
+    let mut proposals = Vec::new();
+
+
+    // We need to call timed phase transition 4 times to move from:
+    // 1. pedersen contributing phase to pedersen complaining phase
+    // 2. pedersen complaining phase to feldman contribution phase
+    // 3. feldman contribution phase to feldman complaining phase
+    // 4. feldman complaining phase to finalization phase
+    // and then call the key generating procedure
+
+    for _ in 0..5 {
+        peer_ids.iter().enumerate().for_each(|(index, _peer_id)| {
+            if let Ok(proposal_vec) = generators[index].timed_phase_transition(&mut rng) {
+                if !non_responsives.contains(&(index as u64)) {
+                    for proposal in proposal_vec {
+                        proposals.push(proposal);
+                    }
+                }
+            }
+        });
+        // Continue the procedure with messaging.
+        messaging(
+            &mut rng,
+            &mut generators,
+            &mut proposals,
+            non_responsives.clone(),
+        );
+        assert!(proposals.is_empty());
+    }
+
+
+
+
+    let all_nodes: BTreeSet<_> = (0u64..(NODES_PER_CLAN*CLANS_PER_TRIBE) as u64).collect();
+    let responsive = all_nodes
+        .difference(&non_responsives)
+        .cloned()
+        .collect_vec();
+
+
+    let msg = "Test message!";
+    let mut clan_signatures: BTreeMap<usize, SignatureShare> = BTreeMap::new();
+    let mut clan_public_keys = Vec::new();
+
+    // generating and verifying signatures in clans
+    for i in 0..CLANS_PER_TRIBE{
+
+        let pub_key_set: PublicKeySet = generators[ responsive[i* (NODES_PER_CLAN - CLAN_THRESHOLD)] as usize]
             .generate_keys()
             .expect("Failed to generate `PublicKeySet` for node #0")
             .1
             .public_key_set;
 
-        let msg = "Test message!";
         let mut sig_shares: BTreeMap<usize, SignatureShare> = BTreeMap::new();
 
-        for (index, key_gen) in generators.iter_mut().enumerate() {
+        for j in 0..NODES_PER_CLAN{
+
+            let index = i * NODES_PER_CLAN + j;
+
             if !non_responsives.contains(&(index as u64)) {
-                let outcome = if let Some(outcome) = key_gen.generate_keys() {
+                let outcome = if let Some(outcome) = generators[i * NODES_PER_CLAN + j].generate_keys() {
                     outcome.1
                 } else {
                     return Err(format_err!(
-                        "Failed to generate `PublicKeySet` and `SecretKeyShare` for node #{}",
-                        index
-                    ));
+                    "Failed to generate `PublicKeySet` and `SecretKeyShare` for node #{}, {}",
+                    i+1, j+1
+                ));
                 };
+
                 let sk = outcome.secret_key_share;
-                let index = key_gen.our_index as usize;
+                let index = generators[i * NODES_PER_CLAN + j].our_index.1 as usize;
                 let pks = outcome.public_key_set;
                 assert_eq!(pks, pub_key_set);
                 let sig = sk.sign(msg);
                 assert!(pks.public_key_share(index).verify(&sig, msg));
                 let _ = sig_shares.insert(index, sig);
+            }
+            else {
+                assert!(generators[i * NODES_PER_CLAN + j].generate_keys().is_none());
+            }
 
-                non_responsives.iter().for_each(|idx| {
-                    assert!(!key_gen.names().contains(&peer_ids[*idx as usize].name()))
-                });
-            } else {
-                assert!(key_gen.generate_keys().is_none());
-            };
         }
 
         let sig = match pub_key_set.combine_signatures(sig_shares.iter()) {
@@ -320,18 +375,207 @@ fn having_max_unresponsive_nodes_still_work() -> Result<()> {
         };
 
         assert!(pub_key_set.public_key().verify(&sig, msg));
+
+        let clan_idx = generators[i*NODES_PER_CLAN].our_index.0 as usize;
+        let _ = clan_signatures.insert(clan_idx, SignatureShare(sig));
+
+        clan_public_keys.push((i, pub_key_set.public_key_G1()));
+
     }
+
+
+    // aggregating and verifying tribe level signature
+
+    let tribe_public_key_g1 = crate::blsttc::interpolate(TRIBE_THRESHOLD-1, clan_public_keys).expect("wrong number of values");
+    let tribe_public_key: PublicKey = tribe_public_key_g1.into();
+
+    let rand_poly: Poly = Poly::random(TRIBE_THRESHOLD-1, &mut rng);
+    let rand_public_key: PublicKeySet =  rand_poly.commitment().into();
+
+    let tribe_signature = match rand_public_key.combine_signatures(clan_signatures.iter()) {
+        Ok(sig) => sig,
+        Err(e) => return Err(format_err!("Unexpected Error {:?}: Not able to generate Signature with THRESHOLD + 1 sig_shares", e)),
+    };
+
+    assert!(tribe_public_key.verify(&tribe_signature, msg));
+
+
     Ok(())
 }
+
+
+
+
+#[test]
+fn having_max_unresponsive_nodes_in_feldman_still_work() -> Result<()> {
+    let mut rng = rand::thread_rng();
+
+    let mut rand_non_resp_nodes_combination = BTreeSet::new();
+
+    let mut start: u64 = 0;
+    let mut end: u64 = NODES_PER_CLAN as u64;
+
+    // creating a list of non-responsive nodes by taking at most NODES_PER_CLAN - CLAN_THRESHOLD - 1
+    // non-responsive nodes from each clan.
+
+    for _i in 0..CLANS_PER_TRIBE{
+        let all_nodes: BTreeSet<_> = (start..end).collect();
+
+        //taking the first combination only
+        let combinations_of_non_resp = all_nodes
+            .iter()
+            .cloned()
+            .combinations(NODES_PER_CLAN - CLAN_THRESHOLD - 1).take(1);
+
+
+        for non_reps in combinations_of_non_resp{
+            rand_non_resp_nodes_combination.append(&mut non_reps.iter().cloned().collect());
+        }
+
+        start = end;
+        end = end + NODES_PER_CLAN as u64;
+
+
+    }
+
+
+    let non_responsives: BTreeSet<u64> = rand_non_resp_nodes_combination.clone();
+    let (peer_ids, mut generators) = setup_generators(&mut rng, BTreeSet::new())?;
+
+    let mut proposals = Vec::new();
+
+    // All nodes contribute for Pedersen-VSS
+    // So we transform from pedersen contributing phase to pedersen complaining phase
+    peer_ids.iter().enumerate().for_each(|(index, _peer_id)| {
+        if let Ok(proposal_vec) = generators[index].timed_phase_transition(&mut rng) {
+
+            for proposal in proposal_vec {
+                proposals.push(proposal);
+            }
+
+        }
+    });
+
+    messaging(
+        &mut rng,
+        &mut generators,
+        &mut proposals,
+        BTreeSet::new(),
+    );
+    assert!(proposals.is_empty());
+
+
+    // Since we have no complaints, we move to Feldman_Contribution Phase
+    // Here we introduce non-contributers.
+    // However, all of the nodes can reconstruct the polynomial using shares
+
+    for _ in 0..4 {
+        peer_ids.iter().enumerate().for_each(|(index, _peer_id)| {
+            if let Ok(proposal_vec) = generators[index].timed_phase_transition(&mut rng) {
+                if !non_responsives.contains(&(index as u64)) {
+                    for proposal in proposal_vec {
+                        proposals.push(proposal);
+                    }
+                }
+            }
+        });
+        // Continue the procedure with messaging.
+        messaging(
+            &mut rng,
+            &mut generators,
+            &mut proposals,
+            non_responsives.clone(),
+        );
+        assert!(proposals.is_empty());
+    }
+
+    //Testing Signature generation and verification
+
+    let msg = "Test message!";
+
+    let mut clan_signatures: BTreeMap<usize, SignatureShare> = BTreeMap::new();
+    let mut clan_public_keys = Vec::new();
+
+    // generating and verifying signatures in clans
+    for i in 0..CLANS_PER_TRIBE{
+
+        let pub_key_set: PublicKeySet = generators[i*NODES_PER_CLAN]
+            .generate_keys()
+            .expect("Failed to generate `PublicKeySet` for node #0")
+            .1
+            .public_key_set;
+
+        let mut sig_shares: BTreeMap<usize, SignatureShare> = BTreeMap::new();
+
+        for j in 0..NODES_PER_CLAN{
+
+            let outcome = if let Some(outcome) = generators[i*NODES_PER_CLAN + j].generate_keys() {
+                outcome.1
+            } else {
+                return Err(format_err!(
+                    "Failed to generate `PublicKeySet` and `SecretKeyShare` for node #{}, {}",
+                    i+1, j+1
+                ));
+            };
+
+            let sk = outcome.secret_key_share;
+            let index = generators[i*NODES_PER_CLAN + j].our_index.1 as usize;
+            let pks = outcome.public_key_set;
+            assert_eq!(pks, pub_key_set);
+            let sig = sk.sign(msg);
+            assert!(pks.public_key_share(index).verify(&sig, msg));
+            let _ = sig_shares.insert(index, sig);
+
+        }
+
+        let sig = match pub_key_set.combine_signatures(sig_shares.iter()) {
+            Ok(sig) => sig,
+            Err(e) => return Err(format_err!("Unexpected Error {:?}: Not able to generate Signature with THRESHOLD + 1 sig_shares", e)),
+        };
+
+        assert!(pub_key_set.public_key().verify(&sig, msg));
+
+        let clan_idx = generators[i*NODES_PER_CLAN].our_index.0 as usize;
+        let _ = clan_signatures.insert(clan_idx, SignatureShare(sig));
+
+        clan_public_keys.push((i, pub_key_set.public_key_G1()));
+
+    }
+
+
+    // aggregating and verifying tribe level signature
+
+    let tribe_public_key_g1 = crate::blsttc::interpolate(TRIBE_THRESHOLD-1, clan_public_keys).expect("wrong number of values");
+    let tribe_public_key: PublicKey = tribe_public_key_g1.into();
+
+    let rand_poly: Poly = Poly::random(TRIBE_THRESHOLD-1, &mut rng);
+    let rand_public_key: PublicKeySet =  rand_poly.commitment().into();
+
+    let tribe_signature = match rand_public_key.combine_signatures(clan_signatures.iter()) {
+        Ok(sig) => sig,
+        Err(e) => return Err(format_err!("Unexpected Error {:?}: Not able to generate Signature with THRESHOLD + 1 sig_shares", e)),
+    };
+
+    assert!(tribe_public_key.verify(&tribe_signature, msg));
+
+
+    Ok(())
+}
+
 
 
 #[test]
 fn having_min_unresponsive_nodes_cause_block() -> Result<()> {
     let mut rng = rand::thread_rng();
+
+
+    // Assuming the first clan has threshold+1 unresponsive nodes
     let mut non_responsives = BTreeSet::<u64>::new();
-    for i in 0..(NODENUM - THRESHOLD) as u64 {
+    for i in 0..(NODES_PER_CLAN - CLAN_THRESHOLD) as u64 {
         let _ = non_responsives.insert(i);
     }
+
+
     let (peer_ids, mut generators) = setup_generators(&mut rng, non_responsives.clone())?;
 
     // The `messaging` function only ignores the non-initial proposals from a non-responsive node.
@@ -362,7 +606,7 @@ fn having_min_unresponsive_nodes_cause_block() -> Result<()> {
     // Then trigger `finalize_complaining_phase`, phase shall be blocked due to too many non-voters.
     for (index, peer_id) in peer_ids.iter().enumerate() {
         if let Err(err) = generators[index].timed_phase_transition(&mut rng) {
-            assert_eq!(err, Error::TooManyNonVoters(non_responsives.clone()));
+            assert_eq!(err, Error::TooManyNonVoters);
         } else {
             return Err(format_err!(
                 "Node {:?}-{:?} shall not progress anymore",
@@ -373,11 +617,18 @@ fn having_min_unresponsive_nodes_cause_block() -> Result<()> {
     }
     // List already returned within the above call to `finalize_complaining_phase`. So here it
     // returns an empty list.
-    generators
+    /*generators
         .iter()
-        .for_each(|generator| assert!(generator.possible_blockers().is_empty()));
+        .for_each(|generator| assert!(generator.possible_blockers().is_empty()));*/
     Ok(())
 }
+
+
+
+
+
+/*
+
 
 #[test]
 fn threshold_signature() -> Result<()> {
